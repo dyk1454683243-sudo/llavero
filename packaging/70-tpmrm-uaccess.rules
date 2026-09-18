@@ -1,0 +1,8 @@
+# Let the active local user reach the TPM resource manager, which llavero uses
+# to seal the vault key to this machine.
+#
+# Preferred over adding the user to the tss group: an ACL is evaluated by UID at
+# open() time, so it applies immediately, whereas supplementary groups are fixed
+# when a process starts and the systemd --user manager often outlives a logout.
+# It is also narrower, being scoped to the active seat session.
+SUBSYSTEM=="tpmrm", KERNEL=="tpmrm[0-9]*", TAG+="uaccess"

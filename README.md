@@ -137,6 +137,7 @@ llavero -vault /tmp/portable.pkv -list
 | `-uv fingerprint\|prompt` | user verification method |
 | `-uv-strict` | deny when the sensor is unusable, instead of falling back |
 | `-passphrase-fd N` | read the passphrase from a descriptor (`0` for stdin) |
+| `-mlock` | lock memory against swap (default true, degrades with a warning) |
 | `-tpm-selftest` | seal and unseal a test secret, then exit |
 | `-auto-approve` | approve everything without prompting. Testing only |
 | `-v` | log every CTAPHID frame |
@@ -180,6 +181,50 @@ What this does **not** protect against:
   `~/.local/share/llavero/` means the passkeys are gone. Keep another
   sign-in method on anything that matters, and back up the vault plus its
   `.tpm` blob, understanding that the pair only works on this machine.
+
+### Process hardening
+
+Applied before the vault is opened, so no decrypted key has ever existed in the
+process by the time the protections are in place:
+
+- **Core dumps are disabled**, with `RLIMIT_CORE` set to a hard zero and
+  `LimitCORE=0` in the unit. This is the one that mattered most. Without it a
+  crash writes the whole process image, every decrypted private key included,
+  to wherever `core_pattern` points, which on a systemd machine means
+  `/var/lib/systemd/coredump` on disk.
+- **`PR_SET_DUMPABLE` is cleared**, which also stops another process running as
+  the same user from attaching with `ptrace` and reading keys out of memory.
+  The flag is read back with `PR_GET_DUMPABLE` rather than trusted, since there
+  is no `/proc` file exposing it and the ownership of `/proc/[pid]` is not the
+  indicator it is commonly assumed to be.
+- **Memory is locked** with `mlockall(MCL_CURRENT|MCL_FUTURE)` so pages holding
+  keys cannot be written to swap. `-mlock=false` turns this off.
+
+None of these are fatal if they fail. A machine that refuses one is still
+better served by a working authenticator, and the log says exactly what did not
+apply.
+
+#### Locked memory needs two limits raised, not one
+
+`mlockall` fails with `ENOMEM` under the usual 8 MB `RLIMIT_MEMLOCK`, because
+that is below the daemon's own resident size. `LimitMEMLOCK=64M` in the user
+unit is **not sufficient on its own**: a user unit cannot raise a hard rlimit
+above the one the `systemd --user` manager itself holds, since that requires
+`CAP_SYS_RESOURCE`. The manager's ceiling has to be raised first:
+
+```sh
+sudo mkdir -p /etc/systemd/system/user@.service.d
+printf '[Service]\nLimitMEMLOCK=64M\n' | \
+  sudo tee /etc/systemd/system/user@.service.d/20-memlock.conf
+sudo systemctl daemon-reload
+```
+
+Then reboot. A relogin is not enough, because the `systemd --user` manager
+commonly survives it and keeps the limits it started with.
+
+Skipping all of this is reasonable if your swap sits on an encrypted volume,
+which already covers the threat that locking memory addresses. The daemon says
+so in the warning it logs.
 
 ### A note on `-uv-strict`
 

@@ -1,0 +1,45 @@
+[Unit]
+Description=Llavero (virtual FIDO2 authenticator)
+Documentation=file:%h/Work/llavero/README.md
+# Bound to the graphical session because approval prompts need Wayland.
+# uwsm exports WAYLAND_DISPLAY and HYPRLAND_INSTANCE_SIGNATURE into the user
+# manager, so omarchy-menu-select and notify-send work from here.
+After=graphical-session.target
+PartOf=graphical-session.target
+# Do not restart forever if the vault simply cannot be unlocked.
+StartLimitBurst=3
+StartLimitIntervalSec=60
+
+[Service]
+Type=simple
+# -uv-strict: if the fingerprint sensor cannot be used, DENY rather than
+# falling back to the desktop prompt alone. This matters because a TPM-unlocked
+# vault opens without any typing, so the fingerprint is the only thing standing
+# between a passing stranger at an unlocked laptop and your accounts.
+# Drop the flag if a wedged sensor ever locks you out and you need to work.
+ExecStart=%h/.local/bin/llavero -uv fingerprint -uv-strict -consent fingerprint
+
+Restart=on-failure
+RestartSec=5
+
+# A crash must never write the vault's private keys to disk. The daemon also
+# sets RLIMIT_CORE itself; this is belt and braces, and it covers the window
+# before main() runs.
+LimitCORE=0
+# Headroom for mlockall(MCL_CURRENT|MCL_FUTURE). The default 8M is below the
+# daemon's own RSS, so without this the lock simply fails.
+#
+# This line alone is not enough. A user unit cannot raise a hard rlimit above
+# the one the systemd --user manager holds, so the manager's own ceiling has to
+# be raised too, in /etc/systemd/system/user@.service.d/. Without that this
+# setting is silently ignored and the daemon logs that it could not lock memory.
+LimitMEMLOCK=64M
+
+NoNewPrivileges=true
+ProtectKernelTunables=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+
+[Install]
+WantedBy=graphical-session.target

@@ -51,6 +51,7 @@ type options struct {
 	uvGrace     time.Duration
 	list        bool
 	forget      string
+	mlock       bool
 	autoApprove bool
 	passFD      int
 	newPassFD   int
@@ -69,6 +70,7 @@ func main() {
 	flag.BoolVar(&opts.uvStrict, "uv-strict", false, "deny when the fingerprint sensor is unusable instead of falling back to the prompt")
 	flag.StringVar(&opts.consent, "consent", "prompt", "how to take consent: prompt (click to approve, then touch) or fingerprint (touch only)")
 	flag.DurationVar(&opts.uvGrace, "uv-grace", 5*time.Second, "reuse a just-completed fingerprint scan for repeat requests from the SAME site (0 disables)")
+	flag.BoolVar(&opts.mlock, "mlock", true, "lock memory so keys cannot be written to swap")
 	flag.BoolVar(&opts.list, "list", false, "list stored passkeys, then exit")
 	flag.StringVar(&opts.forget, "forget", "", "delete passkeys matching a site or a credential id prefix, then exit")
 	flag.BoolVar(&opts.autoApprove, "auto-approve", false, "approve every request without prompting (testing only)")
@@ -201,6 +203,10 @@ func runRekey(opts options) error {
 }
 
 func run(opts options) error {
+	// Before anything touches a key. Core dumps and ptrace are shut off first
+	// so there is no window in which a decrypted vault could escape.
+	hardenProcess(opts.mlock, logf)
+
 	if opts.rekeyTo != "" {
 		return runRekey(opts)
 	}
