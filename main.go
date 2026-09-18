@@ -60,6 +60,7 @@ type options struct {
 func main() {
 	var (
 		opts        options
+		showVersion = flag.Bool("version", false, "print build information and exit")
 		tpmSelftest = flag.Bool("tpm-selftest", false, "seal and unseal a test secret, then exit")
 		verboseFlag = flag.Bool("v", false, "log every CTAPHID frame")
 	)
@@ -78,6 +79,11 @@ func main() {
 	flag.IntVar(&opts.newPassFD, "new-passphrase-fd", -1, "read the NEW passphrase for -rekey from this file descriptor")
 	flag.Parse()
 	verbose = *verboseFlag
+
+	if *showVersion {
+		fmt.Println(versionString())
+		return
+	}
 
 	if *tpmSelftest {
 		if err := runTPMSelftest(); err != nil {
@@ -206,6 +212,10 @@ func run(opts options) error {
 	// Before anything touches a key. Core dumps and ptrace are shut off first
 	// so there is no window in which a decrypted vault could escape.
 	hardenProcess(opts.mlock, logf)
+
+	// First journal line after an upgrade, so a bug report can name the build
+	// without asking the user to remember which binary they installed.
+	logf("%s", versionString())
 
 	if opts.rekeyTo != "" {
 		return runRekey(opts)
