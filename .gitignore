@@ -1,0 +1,8 @@
+# Build output
+/llavero
+/ctaptest
+
+# Never commit a vault or its sealed TPM blob, even a test one.
+*.pkv
+*.pkv.tpm
+*.pkv.bak-*

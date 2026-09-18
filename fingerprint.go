@@ -1,0 +1,157 @@
+package main
+
+// User verification via fprintd.
+//
+// fprintd owns the sensor exclusively, so every check claims the device, runs
+// one verification, and releases it again. Holding the claim between requests
+// would block the login screen and polkit prompts.
+
+import (
+	"errors"
+	"fmt"
+	"os/user"
+	"time"
+
+	"github.com/godbus/dbus/v5"
+)
+
+const (
+	fprintService   = "net.reactivated.Fprint"
+	fprintManager   = "/net/reactivated/Fprint/Manager"
+	fprintDeviceIfc = "net.reactivated.Fprint.Device"
+	fprintMgrIfc    = "net.reactivated.Fprint.Manager"
+
+	// A scan takes a couple of seconds, but the user has to notice the prompt
+	// first, and Chrome may be racing its own passkey provider for their
+	// attention. This bound only exists so a sensor that stops reporting
+	// cannot hang an authentication forever.
+	fingerprintTimeout = 35 * time.Second
+)
+
+// errNoFingerprintHardware means the sensor could not be used at all, as
+// opposed to the finger not matching. Callers treat the two very differently.
+var errNoFingerprintHardware = errors.New("fingerprint sensor unavailable")
+
+type fingerprintVerifier struct {
+	username string
+	logf     func(string, ...any)
+}
+
+func newFingerprintVerifier(logf func(string, ...any)) (*fingerprintVerifier, error) {
+	u, err := user.Current()
+	if err != nil {
+		return nil, err
+	}
+	fv := &fingerprintVerifier{username: u.Username, logf: logf}
+
+	// Prove at startup that a finger is enrolled, rather than discovering it
+	// during the first sign-in.
+	conn, err := dbus.SystemBus()
+	if err != nil {
+		return nil, fmt.Errorf("connecting to the system bus: %w", err)
+	}
+	devPath, err := defaultDevice(conn)
+	if err != nil {
+		return nil, err
+	}
+	dev := conn.Object(fprintService, devPath)
+	var fingers []string
+	if err := dev.Call(fprintDeviceIfc+".ListEnrolledFingers", 0, fv.username).Store(&fingers); err != nil {
+		return nil, fmt.Errorf("listing enrolled fingers: %w", err)
+	}
+	if len(fingers) == 0 {
+		return nil, fmt.Errorf("no fingerprints enrolled for %s (run fprintd-enroll)", fv.username)
+	}
+	logf("fingerprint verification enabled (%d finger(s) enrolled)", len(fingers))
+	return fv, nil
+}
+
+func defaultDevice(conn *dbus.Conn) (dbus.ObjectPath, error) {
+	mgr := conn.Object(fprintService, fprintManager)
+	var devPath dbus.ObjectPath
+	if err := mgr.Call(fprintMgrIfc+".GetDefaultDevice", 0).Store(&devPath); err != nil {
+		return "", fmt.Errorf("%w: %v", errNoFingerprintHardware, err)
+	}
+	return devPath, nil
+}
+
+// verify runs one scan. It returns (true, nil) on a match, (false, nil) on a
+// genuine non-match, and an error only when the sensor could not be used.
+func (fv *fingerprintVerifier) verify(reason string) (bool, error) {
+	conn, err := dbus.SystemBus()
+	if err != nil {
+		return false, fmt.Errorf("%w: %v", errNoFingerprintHardware, err)
+	}
+
+	devPath, err := defaultDevice(conn)
+	if err != nil {
+		return false, err
+	}
+	dev := conn.Object(fprintService, devPath)
+
+	if call := dev.Call(fprintDeviceIfc+".Claim", 0, fv.username); call.Err != nil {
+		return false, fmt.Errorf("%w: claiming the sensor: %v", errNoFingerprintHardware, call.Err)
+	}
+	defer dev.Call(fprintDeviceIfc+".Release", 0)
+
+	// Subscribe before starting, so a fast scan cannot complete before we are
+	// listening and leave us waiting for a signal that already fired.
+	if err := conn.AddMatchSignal(
+		dbus.WithMatchObjectPath(devPath),
+		dbus.WithMatchInterface(fprintDeviceIfc),
+		dbus.WithMatchMember("VerifyStatus"),
+	); err != nil {
+		return false, fmt.Errorf("%w: subscribing to VerifyStatus: %v", errNoFingerprintHardware, err)
+	}
+	defer conn.RemoveMatchSignal(
+		dbus.WithMatchObjectPath(devPath),
+		dbus.WithMatchInterface(fprintDeviceIfc),
+		dbus.WithMatchMember("VerifyStatus"),
+	)
+
+	signals := make(chan *dbus.Signal, 16)
+	conn.Signal(signals)
+	defer conn.RemoveSignal(signals)
+
+	if call := dev.Call(fprintDeviceIfc+".VerifyStart", 0, "any"); call.Err != nil {
+		return false, fmt.Errorf("%w: starting verification: %v", errNoFingerprintHardware, call.Err)
+	}
+	defer dev.Call(fprintDeviceIfc+".VerifyStop", 0)
+
+	notifyPrompt("Touch the fingerprint sensor", reason)
+	defer dismissPrompt()
+	fv.logf("waiting for fingerprint: %s", reason)
+
+	deadline := time.After(fingerprintTimeout)
+	for {
+		select {
+		case <-deadline:
+			return false, fmt.Errorf("%w: no response from the sensor in %s",
+				errNoFingerprintHardware, fingerprintTimeout)
+
+		case sig := <-signals:
+			if sig == nil || sig.Name != fprintDeviceIfc+".VerifyStatus" || len(sig.Body) < 2 {
+				continue
+			}
+			result, _ := sig.Body[0].(string)
+			done, _ := sig.Body[1].(bool)
+
+			if !done {
+				// Retryable conditions: finger moved, scan too short. The
+				// sensor keeps reading, so keep waiting.
+				fv.logf("fingerprint retry: %s", result)
+				continue
+			}
+			switch result {
+			case "verify-match":
+				return true, nil
+			case "verify-no-match":
+				return false, nil
+			case "verify-disconnected":
+				return false, fmt.Errorf("%w: sensor disconnected mid-scan", errNoFingerprintHardware)
+			default:
+				return false, fmt.Errorf("%w: %s", errNoFingerprintHardware, result)
+			}
+		}
+	}
+}

@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>WebAuthn UI Probe</title>
+<style>
+  :root { color-scheme: dark; --bg:#14161a; --fg:#e6e8eb; --mut:#8b929c; --acc:#7aa2f7; --ok:#9ece6a; --err:#f7768e; --line:#272b33; }
+  body { background:var(--bg); color:var(--fg); font:15px/1.55 ui-sans-serif,system-ui,sans-serif; margin:0; padding:32px 24px; }
+  main { max-width:760px; margin:0 auto; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  p.sub { color:var(--mut); margin:0 0 28px; }
+  .case { border:1px solid var(--line); border-radius:10px; padding:16px; margin-bottom:12px; }
+  .case h2 { font-size:15px; margin:0 0 4px; }
+  .case p { color:var(--mut); margin:0 0 12px; font-size:13.5px; }
+  button { background:var(--acc); color:#11131a; border:0; border-radius:7px; padding:8px 16px; font:inherit; font-weight:600; cursor:pointer; }
+  button:disabled { opacity:.4; cursor:default; }
+  button.sec { background:transparent; color:var(--acc); border:1px solid var(--line); }
+  pre { background:#0f1115; border:1px solid var(--line); border-radius:8px; padding:12px; overflow:auto; font-size:12.5px; margin:24px 0 0; max-height:320px; }
+  .ok { color:var(--ok); } .err { color:var(--err); } .mut { color:var(--mut); }
+</style>
+</head>
+<body><main>
+<h1>WebAuthn UI probe</h1>
+<p class="sub">Which request shapes make Chrome show the QR picker, and which go straight to the key. Register once, then try each case and watch what Chrome does.</p>
+
+<div class="case">
+  <h2>0a. Register on the SECURITY KEY (our vault)</h2>
+  <p>Sets <code>authenticatorAttachment: "cross-platform"</code>, which rules out Chrome's own
+  built-in passkey store and forces the request to our virtual key. Touch the sensor when asked.</p>
+  <button id="regcp">Register on security key</button>
+  <button id="clear" class="sec">Forget</button>
+</div>
+
+<div class="case">
+  <h2>0b. Register with no constraint</h2>
+  <p>What most sites do. Shows which provider Chrome picks when left to choose. Watch the
+  reported transports: <code>["usb"]</code> is our key, <code>["hybrid","internal"]</code> is Chrome's own store.</p>
+  <button id="regany" class="sec">Register, Chrome's choice</button>
+</div>
+
+<div class="case">
+  <h2>1. Discoverable request (empty allowCredentials)</h2>
+  <p>What webauthn.io's Authenticate button does. Chrome cannot know where the passkey lives, so it must offer every transport including a phone.</p>
+  <button class="go" data-case="discoverable">Try</button>
+</div>
+
+<div class="case">
+  <h2>2. Targeted, transports: ["usb"]</h2>
+  <p>Names the credential and says it is on a USB device. Chrome has enough to skip the phone option.</p>
+  <button class="go" data-case="usb">Try</button>
+</div>
+
+<div class="case">
+  <h2>3. Targeted, no transport hint</h2>
+  <p>Names the credential but says nothing about where it is.</p>
+  <button class="go" data-case="notransport">Try</button>
+</div>
+
+<div class="case">
+  <h2>4. Discoverable + hints: ["security-key"]</h2>
+  <p>WebAuthn L3 <code>hints</code>, which asks Chrome to prioritise a security key without naming a credential.</p>
+  <button class="go" data-case="hint">Try</button>
+</div>
+
+<pre id="log"><span class="mut">ready</span></pre>
+</main>
+<script>
+const log = document.getElementById('log');
+function say(msg, cls) {
+  const t = new Date().toTimeString().slice(0,8);
+  log.innerHTML += `\n<span class="mut">${t}</span> <span class="${cls||''}">${msg}</span>`;
+  log.scrollTop = log.scrollHeight;
+}
+const b64 = b => btoa(String.fromCharCode(...new Uint8Array(b))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+const unb64 = s => Uint8Array.from(atob(s.replace(/-/g,'+').replace(/_/g,'/')), c => c.charCodeAt(0));
+const rand = n => crypto.getRandomValues(new Uint8Array(n));
+
+document.getElementById('clear').onclick = () => {
+  localStorage.removeItem('credId'); localStorage.removeItem('credTransports');
+  say('forgot the stored credential');
+};
+
+async function register(forceSecurityKey) {
+  const sel = { residentKey: 'required', userVerification: 'preferred' };
+  if (forceSecurityKey) sel.authenticatorAttachment = 'cross-platform';
+  say(`--- register (${forceSecurityKey ? 'cross-platform, our key' : "Chrome's choice"}) ---`);
+  try {
+    const cred = await navigator.credentials.create({ publicKey: {
+      challenge: rand(32),
+      rp: { name: 'UI Probe', id: 'localhost' },
+      user: { id: rand(16), name: 'probe@localhost', displayName: 'Probe User' },
+      pubKeyCredParams: [{ type: 'public-key', alg: -7 }],
+      authenticatorSelection: sel,
+      timeout: 60000,
+      attestation: 'none',
+    }});
+    const t = cred.response.getTransports ? cred.response.getTransports() : [];
+    // authenticatorAttachment is the reliable signal. transports comes back
+    // empty for our key because we do not advertise the CTAP2.1 transports
+    // field, so testing it for "usb" mislabels our own vault as Chrome's.
+    const ours = cred.authenticatorAttachment === 'cross-platform';
+    if (forceSecurityKey) {
+      localStorage.setItem('credId', b64(cred.rawId));
+      localStorage.setItem('credTransports', JSON.stringify(t));
+    } else {
+      // Do not overwrite the vault credential the auth cases target. Pointing
+      // them at a credential held by Chrome makes every targeted case fail and
+      // looks like the picker behaving differently when it is not.
+      say('  (kept the vault credential for the auth cases below)', 'mut');
+    }
+    say(`registered ${b64(cred.rawId).slice(0,12)}…`, 'ok');
+    say(`  transports: ${JSON.stringify(t)}  attachment: ${cred.authenticatorAttachment}`, ours ? 'ok' : 'err');
+    say(`  => ${ours ? 'OUR VAULT (cross-platform)' : "CHROME'S OWN STORE (platform), not the vault"}`, ours ? 'ok' : 'err');
+  } catch (e) { say(`register failed: ${e.name}: ${e.message}`, 'err'); }
+}
+document.getElementById('regcp').onclick  = () => register(true);
+document.getElementById('regany').onclick = () => register(false);
+
+document.querySelectorAll('.go').forEach(btn => btn.onclick = async () => {
+  const kind = btn.dataset.case;
+  const stored = localStorage.getItem('credId');
+  if (kind !== 'discoverable' && kind !== 'hint' && !stored) { say('register first', 'err'); return; }
+
+  const opts = { challenge: rand(32), rpId: 'localhost', timeout: 60000, userVerification: 'preferred' };
+  const stash = localStorage.getItem('credTransports');
+  if (stash) say(`  (stored credential lives on: ${stash})`, 'mut');
+  if (kind === 'usb')          opts.allowCredentials = [{ type:'public-key', id: unb64(stored), transports:['usb'] }];
+  if (kind === 'notransport')  opts.allowCredentials = [{ type:'public-key', id: unb64(stored) }];
+  if (kind === 'hint')         opts.hints = ['security-key'];
+
+  say(`--- case "${kind}" ---`);
+  const t0 = performance.now();
+  try {
+    const a = await navigator.credentials.get({ publicKey: opts });
+    say(`signed in after ${Math.round(performance.now()-t0)}ms, credential ${b64(a.rawId).slice(0,12)}…`, 'ok');
+  } catch (e) { say(`${e.name}: ${e.message}`, 'err'); }
+});
+</script>
+</body></html>
