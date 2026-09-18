@@ -285,29 +285,32 @@ func (a *authenticator) getAssertion(body []byte) []byte {
 	}
 
 	// With several accounts at one site, let the user pick rather than
-	// silently choosing for them.
+	// silently choosing for them. Rows carry a credential-id subtext so two
+	// "alice" accounts stay distinguishable, and we resolve the selection by
+	// that identity rather than by the display name.
 	chosen := matches[0]
 	if len(matches) > 1 {
-		labels := make([]string, 0, len(matches))
-		for _, c := range matches {
-			labels = append(labels, displayName(userEntity{
-				Name: c.UserName, DisplayName: c.UserDisplay,
-			}))
+		opts := make([]accountPickerOption, len(matches))
+		rows := make([]string, len(matches))
+		for i, c := range matches {
+			opts[i] = newAccountPickerOption(c)
+			rows[i] = opts[i].row
 		}
 		choice, err := a.approver.confirm(
-			fmt.Sprintf("Sign in to %s as:", req.RPID), labels)
+			fmt.Sprintf("Sign in to %s as:", req.RPID), rows)
 		if err != nil || choice == "" {
 			a.logf("getAssertion: declined or timed out for %s", req.RPID)
 			return []byte{statusOperationDenied}
 		}
-		idx := indexOf(labels, choice)
+		idx := matchAccountChoice(choice, opts)
 		if idx < 0 {
+			a.logf("getAssertion: picker result %q did not match a credential for %s", choice, req.RPID)
 			return []byte{statusOperationDenied}
 		}
-		chosen = matches[idx]
+		chosen = opts[idx].cred
 		// Choosing an account is itself the consent, so only verification is
 		// left to do.
-		if !a.verifyUserFor(req.RPID, fmt.Sprintf("Sign in to %s as %s", req.RPID, labels[idx])) {
+		if !a.verifyUserFor(req.RPID, fmt.Sprintf("Sign in to %s as %s", req.RPID, opts[idx].label)) {
 			return []byte{statusOperationDenied}
 		}
 	} else {
@@ -461,9 +464,53 @@ func isPrintable(s string) bool {
 	return true
 }
 
-func indexOf(hay []string, needle string) int {
-	for i, s := range hay {
-		if s == needle {
+// credIDPrefix is the same fragment -list prints in the CREDENTIAL column, so
+// the picker subtext matches what the user already sees in the vault listing.
+func credIDPrefix(id []byte) string {
+	n := 8
+	if len(id) < n {
+		n = len(id)
+	}
+	if n == 0 {
+		return ""
+	}
+	return fmt.Sprintf("%x", id[:n])
+}
+
+// accountPickerOption is one row in the multi-account sign-in menu.
+//
+// row is what we hand to the prompt. For omarchy-menu-select that is the
+// three-field form (empty glyph, label, subtext) so two accounts that share a
+// username still look different. key is what that picker returns —
+// label\tsubtext — which is unique because the subtext is the credential-id
+// prefix. Matching is by row or key, never by the display name alone.
+type accountPickerOption struct {
+	cred  storedCredential
+	row   string
+	key   string
+	label string
+}
+
+func newAccountPickerOption(c storedCredential) accountPickerOption {
+	label := displayName(userEntity{Name: c.UserName, DisplayName: c.UserDisplay})
+	// A tab would split the omarchy fields, so it cannot appear in either.
+	label = strings.ReplaceAll(label, "\t", " ")
+	sub := credIDPrefix(c.ID)
+	return accountPickerOption{
+		cred:  c,
+		row:   "\t" + label + "\t" + sub,
+		key:   label + "\t" + sub,
+		label: label,
+	}
+}
+
+func matchAccountChoice(choice string, opts []accountPickerOption) int {
+	choice = strings.TrimSpace(choice)
+	if choice == "" {
+		return -1
+	}
+	for i, o := range opts {
+		if choice == o.row || choice == o.key {
 			return i
 		}
 	}
